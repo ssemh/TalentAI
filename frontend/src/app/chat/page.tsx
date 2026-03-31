@@ -1,4 +1,5 @@
 import ChatClient from "../../components/ChatClient";
+import { Suspense } from "react";
 import TopTabs from "../ui/TopTabs";
 
 export default function ChatPage() {
@@ -19,7 +20,9 @@ export default function ChatPage() {
             <TopTabs />
           </div>
         </header>
-        <ChatClient />
+        <Suspense fallback={<div className="text-sm text-slate-400">Yükleniyor...</div>}>
+          <ChatClient />
+        </Suspense>
       </div>
     </main>
   );
