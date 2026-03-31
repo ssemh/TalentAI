@@ -18,12 +18,46 @@ export default function InterviewPage() {
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isStarted, setIsStarted] = useState(false);
+  const [questionCount, setQuestionCount] = useState(0);
   const username = useMemo(() => normalizeUsername(value), [value]);
   const apiBase = useMemo(() => process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000", []);
 
+  async function startInterview() {
+    if (!username || loading) return;
+    setLoading(true);
+    setError(null);
+    setHistory([]);
+    setPrompt("");
+    setQuestionCount(0);
+    try {
+      const res = await fetch(`${apiBase}/api/interview/start/${encodeURIComponent(username)}`, { method: "GET" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        const detail = data && typeof data === "object" && "detail" in data ? String((data as any).detail) : "Mülakat başlatılamadı.";
+        throw new Error(detail);
+      }
+
+      const opener = data && typeof data === "object" && "opener" in data ? String((data as any).opener) : "";
+      const firstQuestion = data && typeof data === "object" && "first_question" in data ? String((data as any).first_question) : "";
+      const introParts = [opener, firstQuestion].filter(Boolean);
+      const uniqueIntroParts = introParts.filter((part, idx) => introParts.indexOf(part) === idx);
+      const intro = uniqueIntroParts.join("\n\n");
+
+      setHistory([{ role: "assistant", content: intro || "Mülakat başlatıldı. İlk sorum: Bir projende verdiğin kritik teknik kararı anlatır mısın?" }]);
+      setQuestionCount(1);
+      setIsStarted(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setIsStarted(false);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function sendMessage(e: FormEvent) {
     e.preventDefault();
-    if (!username || !prompt.trim() || loading) return;
+    if (!username || !isStarted || !prompt.trim() || loading) return;
 
     const userText = prompt.trim();
     const nextHistory = [...history, { role: "user" as const, content: userText }];
@@ -33,21 +67,13 @@ export default function InterviewPage() {
     setError(null);
 
     try {
-      const res = await fetch(`${apiBase}/api/ai/chat`, {
+      const res = await fetch(`${apiBase}/api/interview/turn`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          messages: [
-            {
-              role: "system",
-              content:
-                `Sen TalentAI Interview asistanısın. Kullanıcının GitHub adı @${username}. ` +
-                "Cevapların kısa, net ve Türkçe olsun. Teknik mülakat odağında ilerle.",
-            },
-            ...nextHistory.map((m) => ({ role: m.role, content: m.content })),
-          ],
-          temperature: 0.4,
-          max_tokens: 512,
+          username,
+          answer: userText,
+          history: history.slice(-8).map((m) => ({ role: m.role, content: m.content })),
         }),
       });
 
@@ -57,10 +83,18 @@ export default function InterviewPage() {
         throw new Error(detail);
       }
 
-      const reply = data && typeof data === "object" && "reply" in data ? String((data as any).reply) : "";
+      const feedback = data && typeof data === "object" && "feedback" in data ? String((data as any).feedback) : "";
+      const nextQuestion = data && typeof data === "object" && "next_question" in data ? String((data as any).next_question) : "";
+      const ended = Boolean(data && typeof data === "object" && "interview_ended" in data && (data as any).interview_ended);
+      const reply = [feedback, nextQuestion].filter(Boolean).join("\n\n");
       if (!reply) throw new Error("AI boş yanıt döndürdü.");
 
       setHistory((prev) => [...prev, { role: "assistant", content: reply }]);
+      if (ended) {
+        setIsStarted(false);
+      } else {
+        setQuestionCount((prev) => prev + 1);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -122,16 +156,27 @@ export default function InterviewPage() {
                 ].join(" ")}
                 type="button"
                 disabled={!username}
+                onClick={() => void startInterview()}
+              >
+                {loading ? "Başlatılıyor..." : "Mülakatı Başlat"}
+              </button>
+
+              <button
+                className="mt-2 w-full rounded-2xl border border-white/20 bg-white/5 px-4 py-2.5 text-sm font-semibold text-slate-200"
+                type="button"
                 onClick={() => {
                   setHistory([]);
+                  setPrompt("");
                   setError(null);
+                  setIsStarted(false);
+                  setQuestionCount(0);
                 }}
               >
                 Oturumu Sıfırla
               </button>
 
               <div className="mt-3 text-xs text-on-surface-variant">
-                Sonraki adım: repo koduna göre kişiselleştirilmiş soru üretimi + cevap değerlendirme.
+                {isStarted ? `Soru sayısı: ${questionCount}` : "AI tabanlı mülakat için önce oturumu başlat."}
               </div>
             </div>
 
@@ -143,7 +188,7 @@ export default function InterviewPage() {
                   {history.length === 0 ? (
                     <div className="text-sm text-slate-400">
                       {username
-                        ? `@${username} için ilk mesajını gönder, AI mülakatı başlasın.`
+                        ? `@${username} için "Mülakatı Başlat" butonuna bas.`
                         : "Önce soldan bir GitHub kullanıcı adı gir."}
                     </div>
                   ) : (
@@ -173,15 +218,15 @@ export default function InterviewPage() {
                     className="w-full rounded-xl border border-white/10 bg-black/20 px-3 py-2 text-sm outline-none transition focus:border-tertiary/50 focus:bg-black/30"
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
-                    placeholder="Örn: Backend projemde test stratejisini nasıl anlatmalıyım?"
-                    disabled={!username || loading}
+                    placeholder="Cevabını yaz..."
+                    disabled={!username || !isStarted || loading}
                   />
                   <button
                     type="submit"
                     className="btn-primary rounded-xl px-4 py-2 text-sm font-bold disabled:opacity-60"
-                    disabled={!username || !prompt.trim() || loading}
+                    disabled={!username || !isStarted || !prompt.trim() || loading}
                   >
-                    Gönder
+                    Cevabı Gönder
                   </button>
                 </form>
               </div>
