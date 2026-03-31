@@ -2,6 +2,8 @@ import asyncio
 import base64
 import io
 import os
+import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -189,6 +191,27 @@ class GithubAnalysisResponse(BaseModel):
     model: str
 
 
+class InterviewStartResponse(BaseModel):
+    username: str
+    opener: str
+    first_question: str
+    model: str
+
+
+class InterviewTurnRequest(BaseModel):
+    username: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    history: List[ChatMessage] = Field(default_factory=list)
+
+
+class InterviewTurnResponse(BaseModel):
+    username: str
+    feedback: str
+    next_question: str
+    model: str
+    interview_ended: bool = False
+
+
 def _extract_lm_studio_text(message: Dict[str, Any]) -> str:
     # LM Studio / OpenAI uyumlu yanıtlar modele göre farklı alanlar döndürebilir.
     raw_content = message.get("content")
@@ -214,6 +237,231 @@ def _extract_lm_studio_text(message: Dict[str, Any]) -> str:
         return alt_text.strip()
 
     return ""
+
+
+def _sanitize_public_reply(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    # Bazı modeller düşünce sürecini <think>...</think> içinde döndürüyor.
+    while True:
+        start = cleaned.find("<think>")
+        end = cleaned.find("</think>")
+        if start == -1 or end == -1 or end < start:
+            break
+        cleaned = (cleaned[:start] + cleaned[end + len("</think>") :]).strip()
+
+    # Basit etiket temizliği (model farklı formatta dönerse).
+    for marker in ("[THINK]", "[/THINK]", "Reasoning:", "Düşünce süreci:"):
+        cleaned = cleaned.replace(marker, "")
+
+    # Yaygın "düşünme" satırlarını temizle.
+    blocked_line_patterns = [
+        r"^\s*(thinking|thoughts?|reasoning|internal monologue|chain[- ]of[- ]thought)\b.*$",
+        r"^\s*(düşünce|akıl yürütme|gerekçe|mantık adımları)\b.*$",
+        r"^\s*(let me think|i should|i need to think)\b.*$",
+        r"^\s*(önce şunu düşüneyim|adım adım düşünelim)\b.*$",
+    ]
+    kept_lines: List[str] = []
+    for line in cleaned.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if any(re.match(pat, line_stripped, flags=re.IGNORECASE) for pat in blocked_line_patterns):
+            continue
+        kept_lines.append(line)
+
+    cleaned = "\n".join(kept_lines).strip()
+    return cleaned
+
+
+def _interview_system_prompt(username: str, repo_context: str) -> str:
+    return (
+        "Sen TalentAI teknik mülakat asistanısın.\n"
+        "Sadece aşağıdaki GitHub repo özetine dayanarak mülakat yürüt.\n"
+        "Türkçe, profesyonel ve net yaz. Ayrımcı/kişisel yorum yapma.\n"
+        "Asla iç düşünce, akıl yürütme adımları veya zincirleme düşünme metni yazma.\n"
+        "Sadece kullanıcıya gösterilecek nihai yanıtı üret.\n"
+        "Tek seferde 1 soru sor.\n"
+        "Her turda önce kısa geri bildirim ver, sonra yeni soru sor.\n"
+        "Soru stratejisi:\n"
+        "- GitHub verisinden çıkarılabilen repo/dil/README sinyallerini kullan.\n"
+        "- Sadece koda bağlı kalma; genel mühendislik, problem çözme, iletişim, önceliklendirme, "
+        "test, bakım, ürün etkisi gibi kodsuz yönleri de sor.\n"
+        "- Mümkün olduğunda soruyu adayın GitHub profiline bağla (repo adı/dil/README referansı).\n"
+        "- Veri yetersizse bunu belirtip genel ama teknik açıdan anlamlı bir soru sor.\n"
+        "Kullanıcı: @{username}\n"
+        "Repo özeti:\n"
+        f"{repo_context if repo_context else '- repo bilgisi yok -'}"
+    )
+
+
+def _extract_between(text: str, start_tag: str, end_tag: str) -> str:
+    start = text.find(start_tag)
+    end = text.find(end_tag)
+    if start == -1 or end == -1 or end <= start:
+        return ""
+    return text[start + len(start_tag) : end].strip()
+
+
+def _pick_question_from_text(text: str) -> str:
+    # Etiket gelmezse, metindeki son soru cümlesini yakalamaya çalış.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for line in reversed(lines):
+        if "?" in line:
+            return line
+    return ""
+
+
+def _default_github_question(username: str, repos: List[Dict[str, Any]]) -> str:
+    if repos:
+        first = repos[0]
+        repo_name = str(first.get("name", "")).strip() or "bir reposunda"
+        languages = first.get("languages") if isinstance(first.get("languages"), dict) else {}
+        top_lang = ""
+        if languages:
+            sorted_langs = sorted(
+                [(k, v) for k, v in languages.items() if isinstance(k, str) and isinstance(v, int)],
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if sorted_langs:
+                top_lang = sorted_langs[0][0]
+        if top_lang:
+            return (
+                f"@{username} profilinde `{repo_name}` ve `{top_lang}` öne çıkıyor. "
+                f"Bu repoda aldığın en kritik teknik kararı ve nedenini anlatır mısın?"
+            )
+        return f"@{username} profilindeki `{repo_name}` için aldığın kritik teknik kararı ve trade-off'larını anlatır mısın?"
+    return "GitHub profiline göre bir projen için aldığın önemli teknik kararı ve nedenlerini anlatır mısın?"
+
+
+def _diverse_github_question(username: str, repos: List[Dict[str, Any]]) -> str:
+    if not repos:
+        generic_templates = [
+            "GitHub profilini baz alarak, son dönemde çözdüğün zor bir teknik problemi nasıl parçaladığını anlatır mısın?",
+            "Bir projede verdiğin kritik teknik kararı, alternatiflerini ve neden seçtiğini paylaşır mısın?",
+            "Bakım maliyeti ile geliştirme hızını dengelemek için uyguladığın yaklaşımı örnekle anlatır mısın?",
+        ]
+        return random.choice(generic_templates)
+
+    repo = random.choice(repos[: min(len(repos), 6)])
+    repo_name = str(repo.get("name", "")).strip() or "bir repoda"
+    languages = repo.get("languages") if isinstance(repo.get("languages"), dict) else {}
+    top_lang = ""
+    if languages:
+        sorted_langs = sorted(
+            [(k, v) for k, v in languages.items() if isinstance(k, str) and isinstance(v, int)],
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if sorted_langs:
+            top_lang = sorted_langs[0][0]
+
+    templates_with_lang = [
+        f"@{username} profilinde `{repo_name}` içinde `{top_lang}` seçiminin teknik gerekçelerini ve alternatiflerini anlatır mısın?",
+        f"`{repo_name}` projesinde `{top_lang}` kullanırken performans-bakım dengesini nasıl kurduğunu örnekle açıklar mısın?",
+        f"`{repo_name}` geliştirirken `{top_lang}` tarafında karşılaştığın en zor problemi ve çözüm stratejini paylaşır mısın?",
+    ]
+    templates_without_lang = [
+        f"@{username} profilindeki `{repo_name}` için verdiğin en kritik teknik kararı ve trade-off'larını anlatır mısın?",
+        f"`{repo_name}` projesinde mimariyi belirlerken değerlendirdiğin alternatifleri ve neden bu yolu seçtiğini açıklar mısın?",
+        f"`{repo_name}` üzerinde çalışırken kalite, hız ve bakım maliyetini nasıl dengelediğini anlatır mısın?",
+    ]
+
+    if top_lang:
+        return random.choice(templates_with_lang)
+    return random.choice(templates_without_lang)
+
+
+def _normalize_feedback(text: str) -> str:
+    cleaned = _sanitize_public_reply(text)
+    if not cleaned:
+        return ""
+    blocked = [
+        "daha fazla bilgi istemek gerekebilir",
+        "adayın cevabında",
+        "iç değerlendirme",
+        "let me think",
+        "reasoning",
+    ]
+    lines: List[str] = []
+    for raw in cleaned.splitlines():
+        line = raw.strip(" -\t")
+        if not line:
+            continue
+        lower = line.lower()
+        if any(b in lower for b in blocked):
+            continue
+        lines.append(f"- {line}")
+    # En fazla 3 kısa madde göster.
+    return "\n".join(lines[:3]).strip()
+
+
+def _normalize_question(text: str) -> str:
+    q = _sanitize_public_reply(text).strip()
+    if not q:
+        return ""
+    # Tek satır, net soru.
+    q = " ".join(q.split())
+    blocked_fragments = [
+        "mesela",
+        "örneğin",
+        "gibi bir soru",
+        "belki daha spes",
+        "daha spesifik",
+    ]
+    low = q.lower()
+    if any(fragment in low for fragment in blocked_fragments):
+        return ""
+    if "?" not in q:
+        q = f"{q}?"
+    return q
+
+
+def _normalize_for_compare(text: str) -> str:
+    lowered = text.lower()
+    lowered = re.sub(r"[^a-z0-9çğıöşü\s]", " ", lowered, flags=re.IGNORECASE)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def _contains_abusive_language(text: str) -> bool:
+    content = _normalize_for_compare(text)
+    banned = [
+        "gerizekali",
+        "gerizekalı",
+        "salak",
+        "aptal",
+        "mal",
+        "orospu",
+        "piç",
+        "siktir",
+        "amk",
+        "aq",
+    ]
+    return any(word in content for word in banned)
+
+
+def _previous_questions_from_history(history: List[ChatMessage]) -> List[str]:
+    questions: List[str] = []
+    for msg in history:
+        if msg.role != "assistant":
+            continue
+        q = _pick_question_from_text(msg.content)
+        if q:
+            questions.append(_normalize_for_compare(q))
+    return questions
+
+
+def _fallback_question_by_mode(username: str, repos: List[Dict[str, Any]], prefer_general: bool) -> str:
+    if prefer_general:
+        return (
+            "Takım içinde teknik bir anlaşmazlık yaşadığında, veriye dayalı karar almak için nasıl bir "
+            "iletişim ve önceliklendirme süreci izlersin?"
+        )
+    return _default_github_question(username, repos)
 
 
 async def _lm_studio_chat(payload: LMStudioChatRequest) -> LMStudioChatResponse:
@@ -254,9 +502,13 @@ async def _lm_studio_chat(payload: LMStudioChatRequest) -> LMStudioChatResponse:
             ),
         )
 
+    public_reply = _sanitize_public_reply(content)
+    if not public_reply:
+        raise HTTPException(status_code=502, detail="LM Studio yalnızca düşünme çıktısı döndürdü; final yanıt alınamadı.")
+
     return LMStudioChatResponse(
         model=str(data.get("model", LM_STUDIO_MODEL)),
-        reply=content,
+        reply=public_reply,
         usage=data.get("usage") if isinstance(data, dict) else None,
     )
 
@@ -351,6 +603,103 @@ async def _analyze_github_profile_with_ai(username: str, repos: List[Dict[str, A
         repo_count=len(repos),
         analysis=ai_resp.reply,
         model=ai_resp.model,
+    )
+
+
+async def _start_interview(username: str, repos: List[Dict[str, Any]]) -> InterviewStartResponse:
+    opener = "Mülakatı başlatıyorum. Cevaplarını kısa ama teknik gerekçelerle açıklamanı isteyeceğim."
+    first_question = _diverse_github_question(username, repos)
+
+    return InterviewStartResponse(
+        username=username,
+        opener=opener,
+        first_question=first_question,
+        model=LM_STUDIO_MODEL,
+    )
+
+
+async def _interview_turn(payload: InterviewTurnRequest, repos: List[Dict[str, Any]]) -> InterviewTurnResponse:
+    if _contains_abusive_language(payload.answer):
+        return InterviewTurnResponse(
+            username=payload.username,
+            feedback=(
+                "- Uygunsuz/argo ifade tespit edildi.\n"
+                "- Mülakat oturumu güvenlik politikası gereği sonlandırıldı."
+            ),
+            next_question="",
+            model=LM_STUDIO_MODEL,
+            interview_ended=True,
+        )
+
+    normalized_answer = payload.answer.strip().lower()
+    warmup_answers = {"hazırım", "evet", "başlayalım", "ok", "tamam", "hazir"}
+    if normalized_answer in warmup_answers or len(normalized_answer) <= 12:
+        return InterviewTurnResponse(
+            username=payload.username,
+            feedback="- Harika, başlıyoruz.",
+            next_question=_default_github_question(payload.username, repos),
+            model=LM_STUDIO_MODEL,
+        )
+
+    repo_context = _build_repo_context(repos, max_repos=18)
+    trimmed_history = payload.history[-16:] if payload.history else []
+    prior_questions = _previous_questions_from_history(payload.history)
+    assistant_turns = len([m for m in payload.history if m.role == "assistant"])
+    # İlk sorudan sonra dengeli akış:
+    # tek sayılı tur -> genel/kodsuz yetkinlik ağırlığı
+    # çift sayılı tur -> GitHub/kod-teknik ağırlığı
+    prefer_general = assistant_turns % 2 == 1
+    question_style = (
+        "Bu turda ağırlığı GENEL/KODSUZ yetkinliğe ver "
+        "(problem çözme, iletişim, önceliklendirme, takım içi kararlar, ürün etkisi). "
+        "Mümkünse yine GitHub verisine hafif referans ver."
+        if prefer_general
+        else "Bu turda ağırlığı GITHUB/KOD-TEKNİK soruya ver "
+        "(repo, dil tercihi, mimari, trade-off, test, performans)."
+    )
+    messages: List[ChatMessage] = [
+        ChatMessage(role="system", content=_interview_system_prompt(username=payload.username, repo_context=repo_context)),
+        *trimmed_history,
+        ChatMessage(role="user", content=f"Aday cevabı:\n{payload.answer}"),
+        ChatMessage(
+            role="user",
+            content=(
+                "Yalnızca şu formatı kullan:\n"
+                "[FEEDBACK]\n"
+                "2-4 madde: güçlü taraf + geliştirme önerisi\n"
+                "[/FEEDBACK]\n"
+                "[NEXT_QUESTION]\n"
+                "tek yeni teknik soru\n"
+                "[/NEXT_QUESTION]\n\n"
+                f"Ek kural: {question_style}"
+            ),
+        ),
+    ]
+
+    ai_resp = await _lm_studio_chat(LMStudioChatRequest(messages=messages, temperature=0.3, max_tokens=650))
+    feedback = _normalize_feedback(_extract_between(ai_resp.reply, "[FEEDBACK]", "[/FEEDBACK]"))
+    next_question = _normalize_question(_extract_between(ai_resp.reply, "[NEXT_QUESTION]", "[/NEXT_QUESTION]"))
+
+    if not feedback:
+        feedback = (
+            "- Cevabın anlaşılırdı.\n"
+            "- Trade-off ve alternatifleri bir örnekle daha netleştirmen iyi olur.\n"
+            "- Kararının ölçülebilir etkisini (performans, bakım, hız) ekleyebilirsin."
+        )
+    if not next_question:
+        fallback = _normalize_question(_pick_question_from_text(_sanitize_public_reply(ai_resp.reply)))
+        next_question = fallback or _fallback_question_by_mode(payload.username, repos, prefer_general)
+
+    normalized_next = _normalize_for_compare(next_question)
+    if normalized_next and normalized_next in prior_questions:
+        next_question = _fallback_question_by_mode(payload.username, repos, not prefer_general)
+
+    return InterviewTurnResponse(
+        username=payload.username,
+        feedback=feedback,
+        next_question=next_question,
+        model=ai_resp.model,
+        interview_ended=False,
     )
 
 
@@ -481,6 +830,23 @@ async def analyze_github_profile(username: str) -> GithubAnalysisResponse:
 @app.post("/api/ai/chat", response_model=LMStudioChatResponse)
 async def ai_chat(payload: LMStudioChatRequest) -> LMStudioChatResponse:
     return await _lm_studio_chat(payload)
+
+
+@app.get("/api/interview/start/{username}", response_model=InterviewStartResponse)
+async def interview_start(username: str) -> InterviewStartResponse:
+    repos = await _fetch_github_repos(username.strip())
+    return await _start_interview(username=username.strip(), repos=repos)
+
+
+@app.post("/api/interview/turn", response_model=InterviewTurnResponse)
+async def interview_turn(payload: InterviewTurnRequest) -> InterviewTurnResponse:
+    repos = await _fetch_github_repos(payload.username.strip())
+    normalized = InterviewTurnRequest(
+        username=payload.username.strip(),
+        answer=payload.answer,
+        history=payload.history,
+    )
+    return await _interview_turn(payload=normalized, repos=repos)
 
 
 @app.get("/api/cv/github/{username}")
