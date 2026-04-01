@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 4%;
+    --foreground: 250 20% 98%;
+    --muted: 240 6% 12%;
+    --muted-foreground: 240 5% 60%;
+    --accent: 263 70% 50%;
+    --accent-foreground: 250 20% 98%;
+    --border: 263 30% 18%;
+    --ring: 217 91% 60%;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply border border-white/10 shadow-glow backdrop-blur-xl;
+    background-color: rgba(255, 255, 255, 0.04);
+  }
+  .glass-strong {
+    @apply border border-white/15 shadow-glow backdrop-blur-2xl;
+    background-color: rgba(255, 255, 255, 0.07);
+  }
+  .text-gradient {
+    @apply bg-gradient-to-r from-violet-400 via-blue-400 to-cyan-300 bg-clip-text text-transparent;
+  }
+}
+
+body {
+  min-height: 100vh;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
