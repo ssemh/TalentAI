@@ -1,2 +1,0 @@
-"""TalentAI backend package."""
-
