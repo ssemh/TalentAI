@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import os
 import random
 import re
@@ -25,8 +26,16 @@ GITHUB_API_URL = "https://api.github.com"
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
 MAX_README_CHARS = int(os.getenv("MAX_README_CHARS", "20000"))
+CV_TEXT_MAX_CHARS = int(os.getenv("CV_TEXT_MAX_CHARS", "24000"))
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "local-model")
+
+_CV_DIM_KEYS = (
+    "structure_clarity",
+    "impact_and_results",
+    "skills_depth",
+    "professional_tone",
+)
 
 
 def _github_token() -> Optional[str]:
@@ -176,12 +185,16 @@ class LMStudioChatRequest(BaseModel):
     messages: List[ChatMessage] = Field(min_length=1)
     temperature: float = Field(default=0.4, ge=0.0, le=2.0)
     max_tokens: int = Field(default=512, ge=1, le=4096)
+    # OpenAI uyumlu: bazı sunucular destekler; desteklemezse otomatik yeniden dene.
+    response_json_object: bool = False
 
 
 class LMStudioChatResponse(BaseModel):
     model: str
     reply: str
     usage: Optional[Dict[str, Any]] = None
+    # Skor JSON ayrıştırması: content + reasoning birleşimi (sanitize edilmemiş).
+    raw_for_json_parse: Optional[str] = None
 
 
 class GithubAnalysisResponse(BaseModel):
@@ -212,6 +225,38 @@ class InterviewTurnResponse(BaseModel):
     interview_ended: bool = False
 
 
+class ProfileScoreResponse(BaseModel):
+    username: str
+    github_score: int
+    cv_readiness_score: int
+    github_score_baseline: int
+    cv_readiness_score_baseline: int
+    github_score_ai: Optional[int] = None
+    cv_readiness_score_ai: Optional[int] = None
+    summary: str
+    strengths: List[str]
+    improvements: List[str]
+    signals: Dict[str, Any]
+    model: str
+
+
+class CvDocumentScoreRequest(BaseModel):
+    text: str = Field(min_length=40, max_length=120_000)
+    target_role: Optional[str] = Field(default=None, max_length=240)
+
+
+class CvDocumentScoreResponse(BaseModel):
+    overall_score: int
+    overall_score_baseline: int
+    overall_score_ai: Optional[int] = None
+    dimensions: Dict[str, int]
+    summary: str
+    strengths: List[str]
+    improvements: List[str]
+    signals: Dict[str, Any]
+    model: str
+
+
 def _extract_lm_studio_text(message: Dict[str, Any]) -> str:
     # LM Studio / OpenAI uyumlu yanıtlar modele göre farklı alanlar döndürebilir.
     raw_content = message.get("content")
@@ -239,18 +284,62 @@ def _extract_lm_studio_text(message: Dict[str, Any]) -> str:
     return ""
 
 
+def _content_and_reasoning_parts(message: Dict[str, Any]) -> List[str]:
+    """content (string veya parça listesi) ile reasoning_content'i ayrı parçalar olarak döndür."""
+    parts: List[str] = []
+    raw_content = message.get("content")
+    if isinstance(raw_content, str) and raw_content.strip():
+        parts.append(raw_content.strip())
+    elif isinstance(raw_content, list):
+        for item in raw_content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        parts.append(reasoning.strip())
+    return parts
+
+
+def _merged_raw_for_json_parse(message: Dict[str, Any]) -> str:
+    """
+    Skor JSON'u content veya reasoning'in birinde olabilir; ikisini birleştir.
+    (Örn. content'te LM Studio ön prompt'undan gelen düz metin, reasoning'de JSON.)
+    """
+    if not isinstance(message, dict):
+        return ""
+    chunks = _content_and_reasoning_parts(message)
+    if not chunks:
+        return ""
+    return "\n\n".join(chunks)
+
+
+def _strip_thinking_xml_blocks(text: str) -> str:
+    """LM Studio / DeepSeek: düşünme çıktısını XML benzeri bloklardan ayır."""
+    think_open = "<" + "think" + ">"
+    think_close = "</" + "think" + ">"
+    cleaned = (text or "").strip()
+    pairs = (
+        (think_open, think_close),
+        ("<reasoning>", "</reasoning>"),
+    )
+    for open_t, close_t in pairs:
+        while True:
+            start = cleaned.find(open_t)
+            end = cleaned.find(close_t)
+            if start == -1 or end == -1 or end < start:
+                break
+            cleaned = (cleaned[:start] + cleaned[end + len(close_t) :]).strip()
+    return cleaned
+
+
 def _sanitize_public_reply(text: str) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
 
-    # Bazı modeller düşünce sürecini <think>...</think> içinde döndürüyor.
-    while True:
-        start = cleaned.find("<think>")
-        end = cleaned.find("</think>")
-        if start == -1 or end == -1 or end < start:
-            break
-        cleaned = (cleaned[:start] + cleaned[end + len("</think>") :]).strip()
+    cleaned = _strip_thinking_xml_blocks(cleaned)
 
     # Basit etiket temizliği (model farklı formatta dönerse).
     for marker in ("[THINK]", "[/THINK]", "Reasoning:", "Düşünce süreci:"):
@@ -274,6 +363,37 @@ def _sanitize_public_reply(text: str) -> str:
 
     cleaned = "\n".join(kept_lines).strip()
     return cleaned
+
+
+def _strip_for_json_extraction(text: str) -> str:
+    """Skor JSON'u için: düşünme bloklarını kaldır; satır bazlı agresif filtre uygulama."""
+    return _strip_thinking_xml_blocks((text or "").strip()).strip()
+
+
+def _balanced_json_blobs(text: str) -> List[str]:
+    """Metindeki her dengeli { ... } alt dizgisini sırayla döndür (iç içe için dıştaki blob)."""
+    blobs: List[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        start = i
+        for j in range(i, n):
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blobs.append(text[start : j + 1])
+                    i = j + 1
+                    break
+        else:
+            i += 1
+    return blobs
 
 
 def _interview_system_prompt(username: str, repo_context: str) -> str:
@@ -464,36 +584,72 @@ def _fallback_question_by_mode(username: str, repos: List[Dict[str, Any]], prefe
     return _default_github_question(username, repos)
 
 
+def _lm_studio_wants_json_object(payload: LMStudioChatRequest) -> bool:
+    if not payload.response_json_object:
+        return False
+    return os.getenv("LM_STUDIO_JSON_OBJECT", "true").lower() in ("1", "true", "yes", "y")
+
+
 async def _lm_studio_chat(payload: LMStudioChatRequest) -> LMStudioChatResponse:
     url = f"{LM_STUDIO_BASE_URL}/chat/completions"
-    body = {
+    base_body: Dict[str, Any] = {
         "model": LM_STUDIO_MODEL,
-        "messages": [m.model_dump() for m in payload.messages],
+        "messages": [{"role": m.role, "content": m.content} for m in payload.messages],
         "temperature": payload.temperature,
         "max_tokens": payload.max_tokens,
     }
-    try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(url, json=body)
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LM Studio'ya bağlanılamadı: {str(exc)}",
-        ) from exc
 
-    if resp.status_code >= 400:
-        detail = resp.text[:500] if resp.text else f"status={resp.status_code}"
-        raise HTTPException(status_code=502, detail=f"LM Studio hata döndürdü: {detail}")
+    use_json_object = _lm_studio_wants_json_object(payload)
+    last_error: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
-    data = resp.json()
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for attempt in range(2):
+            body = dict(base_body)
+            if use_json_object and attempt == 0:
+                body["response_format"] = {"type": "json_object"}
+            try:
+                resp = await client.post(url, json=body)
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"LM Studio'ya bağlanılamadı: {str(exc)}",
+                ) from exc
+
+            if resp.status_code == 400 and use_json_object and attempt == 0 and "response_format" in body:
+                last_error = resp.text[:300] if resp.text else "400"
+                continue
+
+            if resp.status_code >= 400:
+                detail = resp.text[:500] if resp.text else f"status={resp.status_code}"
+                raise HTTPException(status_code=502, detail=f"LM Studio hata döndürdü: {detail}")
+
+            parsed = resp.json()
+            data = parsed if isinstance(parsed, dict) else None
+            break
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail=f"LM Studio yanıt veremedi (response_format). Son deneme: {last_error or 'bilinmiyor'}",
+            )
+
+    if not data:
+        raise HTTPException(status_code=502, detail="LM Studio yanıtı beklenmeyen formatta.")
+
     choices = data.get("choices") if isinstance(data, dict) else None
     if not isinstance(choices, list) or not choices:
         raise HTTPException(status_code=502, detail="LM Studio yanıtı beklenmeyen formatta.")
 
     first_choice = choices[0] if isinstance(choices[0], dict) else {}
     message = first_choice.get("message") if isinstance(first_choice, dict) else {}
-    content = _extract_lm_studio_text(message if isinstance(message, dict) else {})
-    if not content:
+    msg_dict = message if isinstance(message, dict) else {}
+
+    merged_raw = _merged_raw_for_json_parse(msg_dict)
+    primary = _extract_lm_studio_text(msg_dict)
+    if not primary and merged_raw:
+        primary = merged_raw
+
+    if not primary:
         raise HTTPException(
             status_code=502,
             detail=(
@@ -502,14 +658,19 @@ async def _lm_studio_chat(payload: LMStudioChatRequest) -> LMStudioChatResponse:
             ),
         )
 
-    public_reply = _sanitize_public_reply(content)
+    public_reply = _sanitize_public_reply(primary)
+    if not public_reply and merged_raw:
+        public_reply = _sanitize_public_reply(merged_raw)
     if not public_reply:
         raise HTTPException(status_code=502, detail="LM Studio yalnızca düşünme çıktısı döndürdü; final yanıt alınamadı.")
+
+    raw_for_json = merged_raw.strip() if merged_raw else primary.strip()
 
     return LMStudioChatResponse(
         model=str(data.get("model", LM_STUDIO_MODEL)),
         reply=public_reply,
         usage=data.get("usage") if isinstance(data, dict) else None,
+        raw_for_json_parse=raw_for_json,
     )
 
 
@@ -537,6 +698,355 @@ def _build_repo_context(repos: List[Dict[str, Any]], max_repos: int = 20) -> str
                 snippet = f"{snippet}… (readme kısaltıldı)"
         lines.append(f"- {name} | diller: {langs_text} | readme: {snippet or '-'}")
     return "\n".join(lines)
+
+
+def _github_baseline_scores(repos: List[Dict[str, Any]]) -> Dict[str, Any]:
+    n = len(repos)
+    if n == 0:
+        return {
+            "github_score": 12,
+            "cv_readiness_score": 8,
+            "signals": {
+                "repo_count": 0,
+                "readme_coverage_pct": 0.0,
+                "unique_languages": 0,
+                "avg_readme_chars": 0,
+                "repos_with_readme": 0,
+            },
+        }
+
+    with_readme = sum(
+        1 for r in repos if isinstance(r.get("readme"), str) and str(r.get("readme", "")).strip()
+    )
+    readme_ratio = with_readme / n
+
+    all_langs: Dict[str, int] = {}
+    for r in repos:
+        langs = r.get("languages") if isinstance(r.get("languages"), dict) else {}
+        for k, v in langs.items():
+            if isinstance(k, str) and isinstance(v, int):
+                all_langs[k] = all_langs.get(k, 0) + v
+    unique_langs = len(all_langs)
+
+    repo_factor = min(45, int(n * 2.2))
+    diversity_factor = min(28, unique_langs * 4)
+    readme_factor = int(readme_ratio * 27)
+    github_score = min(100, repo_factor + diversity_factor + readme_factor)
+
+    avg_readme_len = 0
+    if with_readme:
+        total_chars = sum(len(str(r.get("readme") or "")) for r in repos if isinstance(r.get("readme"), str))
+        avg_readme_len = int(total_chars / with_readme)
+    content_factor = min(30, avg_readme_len // 120)
+    cv_score = min(100, int(readme_ratio * 40) + min(30, int(n * 1.8)) + content_factor)
+
+    return {
+        "github_score": github_score,
+        "cv_readiness_score": cv_score,
+        "signals": {
+            "repo_count": n,
+            "readme_coverage_pct": round(readme_ratio * 100, 1),
+            "unique_languages": unique_langs,
+            "avg_readme_chars": avg_readme_len,
+            "repos_with_readme": with_readme,
+        },
+    }
+
+
+def _parse_score_json(raw: str) -> Optional[Dict[str, Any]]:
+    def _try_parse_blob(blob: str) -> Optional[Dict[str, Any]]:
+        blob = blob.strip()
+        if not blob:
+            return None
+        try:
+            data = json.loads(blob)
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+    # 1) Kod çiti içindeki JSON (DeepSeek/LM Studio sık kullanır)
+    for prefix in ("```json", "```JSON", "```"):
+        if prefix in (raw or ""):
+            parts = (raw or "").split(prefix)
+            for segment in parts[1:]:
+                fence_end = segment.find("```")
+                chunk = segment[:fence_end].strip() if fence_end != -1 else segment.strip()
+                parsed = _try_parse_blob(chunk)
+                if parsed is not None:
+                    return parsed
+
+    base = _strip_for_json_extraction(raw or "")
+    if not base:
+        base = (raw or "").strip()
+
+    # 2) Dengeli süslü parantez: zincir-düşünmedeki ilk '{' genelde yanlış eşleşir; sondan dene.
+    candidates = _balanced_json_blobs(base)
+    for blob in reversed(candidates):
+        parsed = _try_parse_blob(blob)
+        if parsed is not None:
+            return parsed
+
+    # 3) Eski davranış: sanitize sonrası ilk '{' ile son '}' (daraltılmış metin)
+    text = _sanitize_public_reply(raw or "").strip()
+    if text and "```" in text:
+        fence_json = "```json"
+        i = text.find(fence_json)
+        if i != -1:
+            j = text.find("```", i + len(fence_json))
+            if j != -1:
+                text = text[i + len(fence_json) : j].strip()
+        else:
+            i = text.find("```")
+            j = text.find("```", i + 3)
+            if i != -1 and j != -1:
+                text = text[i + 3 : j].strip()
+    if text:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            parsed = _try_parse_blob(text[start : end + 1])
+            if parsed is not None:
+                return parsed
+
+    return None
+
+
+def _clamp_int_score(val: Any) -> Optional[int]:
+    if val is None:
+        return None
+    try:
+        x = int(round(float(val)))
+        return max(0, min(100, x))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cv_text_baseline(text: str) -> Dict[str, Any]:
+    t = text.strip()
+    wc = len(t.split())
+    lower = t.lower()
+    markers = (
+        "deneyim",
+        "experience",
+        "iş tecrübesi",
+        "iş deneyimi",
+        "eğitim",
+        "education",
+        "üniversite",
+        "beceri",
+        "skill",
+        "yetenek",
+        "proje",
+        "project",
+        "özet",
+        "summary",
+        "profil",
+        "profile",
+        "sertifika",
+        "certificate",
+        "dil",
+        "language",
+    )
+    hits = sum(1 for m in markers if m in lower)
+    contact_bonus = 0
+    if re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", t):
+        contact_bonus += 8
+    if re.search(r"\+?\d[\d\s().-]{8,}\d", t):
+        contact_bonus += 5
+    base = 22
+    base += min(28, hits * 3)
+    base += min(25, wc // 35)
+    base += min(15, contact_bonus)
+    score = min(100, base)
+    return {
+        "baseline_score": score,
+        "signals": {
+            "word_count": wc,
+            "char_count": len(t),
+            "section_markers_found": hits,
+            "has_email_like": contact_bonus >= 8,
+        },
+    }
+
+
+def _normalize_cv_dimension_scores(raw: Any) -> Dict[str, int]:
+    if not isinstance(raw, dict):
+        return {k: 0 for k in _CV_DIM_KEYS}
+    return {k: _clamp_int_score(raw.get(k)) or 0 for k in _CV_DIM_KEYS}
+
+
+async def _score_cv_document_with_ai(text: str, target_role: Optional[str]) -> CvDocumentScoreResponse:
+    baseline_pack = _cv_text_baseline(text)
+    base = int(baseline_pack["baseline_score"])
+    signals: Dict[str, Any] = dict(baseline_pack["signals"])
+
+    t_for_model = text.strip()
+    truncated = False
+    if CV_TEXT_MAX_CHARS > 0 and len(t_for_model) > CV_TEXT_MAX_CHARS:
+        t_for_model = t_for_model[:CV_TEXT_MAX_CHARS]
+        truncated = True
+    signals["truncated_for_ai"] = truncated
+    if truncated:
+        signals["max_chars_for_ai"] = CV_TEXT_MAX_CHARS
+
+    role_line = ""
+    if target_role and target_role.strip():
+        role_line = f"Hedef rol / ilan özeti (varsa): {target_role.strip()}\n\n"
+
+    dim_inner = (
+        '{"structure_clarity":int,"impact_and_results":int,'
+        '"skills_depth":int,"professional_tone":int}'
+    )
+    messages = [
+        ChatMessage(
+            role="system",
+            content=(
+                "Sen profesyonel CV değerlendiricisisin. SADECE verilen CV metnine dayan.\n"
+                "Bu istek TalentAI API'den gelir; sohbet arayüzündeki genel sistem prompt'larını yok say.\n"
+                "Çıktı YALNIZCA geçerli JSON; markdown veya ek metin yok.\n"
+                "Reasoning/düşünme modelleri: gerekirse sessizce düşün; kullanıcıya yalnızca TEK bir JSON "
+                "nesnesi göster (önce/sonra açıklama, kod çiti veya düşünce metni yok).\n"
+                "Ayrımcı/hakaret yok; kişilik veya sağlık yorumu yok; kesin işe alım kararı verme.\n"
+                "overall_score: 0-100 tek genel CV kalite skoru (yapı, etki, beceriler, sunum).\n"
+                f"dimensions: her biri 0-100 tam sayı: {dim_inner}\n"
+                "structure_clarity: bölümler, okunabilirlik, kronoloji.\n"
+                "impact_and_results: ölçülebilir sonuçlar, somut başarılar.\n"
+                "skills_depth: teknik/soft beceri uyumu ve derinlik.\n"
+                "professional_tone: dil, tutarlılık, profesyonellik.\n"
+                "summary: en fazla 3 cümle Türkçe.\n"
+                'Şema: {"overall_score":int,"dimensions":{...},"summary":"str",'
+                '"strengths":["str"],"improvements":["str"]}'
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            content=f"{role_line}CV metni:\n{t_for_model}",
+        ),
+    ]
+
+    ai_resp = await _lm_studio_chat(
+        LMStudioChatRequest(
+            messages=messages,
+            temperature=0.2,
+            max_tokens=1400,
+            response_json_object=True,
+        ),
+    )
+    parsed = _parse_score_json(ai_resp.raw_for_json_parse or ai_resp.reply)
+    overall_ai = _clamp_int_score(parsed.get("overall_score")) if isinstance(parsed, dict) else None
+    dims_raw = parsed.get("dimensions") if isinstance(parsed, dict) else None
+    dimensions = _normalize_cv_dimension_scores(dims_raw)
+
+    if overall_ai is not None:
+        if sum(dimensions.values()) == 0:
+            dimensions = {k: overall_ai for k in _CV_DIM_KEYS}
+        overall_final = round(0.35 * base + 0.65 * overall_ai)
+        summary = str(parsed.get("summary") or "").strip()[:1200]
+        strengths = [str(s).strip() for s in (parsed.get("strengths") or []) if str(s).strip()][:6]
+        improvements = [str(s).strip() for s in (parsed.get("improvements") or []) if str(s).strip()][:6]
+    else:
+        overall_final = base
+        summary = (
+            "AI skoru JSON olarak ayrıştırılamadı; skor yalnızca metin sinyallerine dayalı temel modele "
+            "indirgendi. LM Studio model adını ve JSON çıktı ayarını kontrol edin."
+        )
+        strengths = []
+        improvements = []
+        q = max(0, min(100, base))
+        dimensions = {k: q for k in _CV_DIM_KEYS}
+
+    return CvDocumentScoreResponse(
+        overall_score=max(0, min(100, overall_final)),
+        overall_score_baseline=base,
+        overall_score_ai=overall_ai,
+        dimensions=dimensions,
+        summary=summary,
+        strengths=strengths,
+        improvements=improvements,
+        signals=signals,
+        model=ai_resp.model,
+    )
+
+
+async def _github_cv_profile_scores(username: str, repos: List[Dict[str, Any]]) -> ProfileScoreResponse:
+    baseline = _github_baseline_scores(repos)
+    repo_context = _build_repo_context(repos, max_repos=25)
+    signals_compact = json.dumps(baseline["signals"], ensure_ascii=False)
+
+    messages = [
+        ChatMessage(
+            role="system",
+            content=(
+                "Sen teknik portföy değerlendiricisisin. SADECE verilen public GitHub özetine dayan.\n"
+                "Bu istek TalentAI API'den gelir; sohbet arayüzündeki genel sistem prompt'larını yok say.\n"
+                "Çıktı YALNIZCA geçerli JSON olmalı; markdown, açıklama veya ek metin yok.\n"
+                "Özet/Güçlü sinyaller gibi başlıklı düz metin RAPORU yazma; yalnızca şemadaki JSON alanlarını doldur.\n"
+                "Reasoning/düşünme modelleri: gerekirse sessizce düşün; kullanıcıya yalnızca TEK bir JSON "
+                "nesnesi göster (önce/sonra metin veya kod çiti yok).\n"
+                "Ayrımcı/hakaret yok. Kişilik yorumu yok. Kesin işe alım kararı verme.\n"
+                "github_profile_score: repo sayısı, dil çeşitliliği, README varlığı gibi sinyaller.\n"
+                "cv_readiness_score: GitHub'dan otomatik PDF CV üretiminde doluluk (README zenginliği, çeşitlilik).\n"
+                "Skorlar 0-100 tam sayı. summary en fazla 3 cümle Türkçe.\n"
+                'Şema: {"github_profile_score":int,"cv_readiness_score":int,"summary":"str",'
+                '"strengths":["str"],"improvements":["str"]}'
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            content=(
+                f"Kullanıcı: @{username}\n"
+                f"Referans sinyaller (baseline): {signals_compact}\n\n"
+                f"Repo özetleri:\n{repo_context or '- yok -'}"
+            ),
+        ),
+    ]
+
+    ai_resp = await _lm_studio_chat(
+        LMStudioChatRequest(
+            messages=messages,
+            temperature=0.15,
+            max_tokens=1400,
+            response_json_object=True,
+        ),
+    )
+    parsed = _parse_score_json(ai_resp.raw_for_json_parse or ai_resp.reply)
+
+    gh_ai = _clamp_int_score(parsed.get("github_profile_score")) if isinstance(parsed, dict) else None
+    cv_ai = _clamp_int_score(parsed.get("cv_readiness_score")) if isinstance(parsed, dict) else None
+
+    gh_base = int(baseline["github_score"])
+    cv_base = int(baseline["cv_readiness_score"])
+
+    if gh_ai is not None and cv_ai is not None:
+        gh_final = round(0.45 * gh_base + 0.55 * gh_ai)
+        cv_final = round(0.45 * cv_base + 0.55 * cv_ai)
+        summary = str(parsed.get("summary") or "").strip()[:1200]
+        strengths = [str(s).strip() for s in (parsed.get("strengths") or []) if str(s).strip()][:6]
+        improvements = [str(s).strip() for s in (parsed.get("improvements") or []) if str(s).strip()][:6]
+    else:
+        gh_final = gh_base
+        cv_final = cv_base
+        summary = (
+            "AI skoru JSON olarak ayrıştırılamadı; skorlar yalnızca GitHub sinyallerinden hesaplanan "
+            "temel modele dayanıyor. LM Studio model/çıktı ayarını kontrol edin."
+        )
+        strengths = []
+        improvements = []
+
+    return ProfileScoreResponse(
+        username=username,
+        github_score=gh_final,
+        cv_readiness_score=cv_final,
+        github_score_baseline=gh_base,
+        cv_readiness_score_baseline=cv_base,
+        github_score_ai=gh_ai,
+        cv_readiness_score_ai=cv_ai,
+        summary=summary,
+        strengths=strengths,
+        improvements=improvements,
+        signals=baseline["signals"],
+        model=ai_resp.model,
+    )
 
 
 async def _analyze_github_profile_with_ai(username: str, repos: List[Dict[str, Any]]) -> GithubAnalysisResponse:
@@ -825,6 +1335,17 @@ async def get_github_repos(username: str) -> List[Dict[str, Any]]:
 async def analyze_github_profile(username: str) -> GithubAnalysisResponse:
     repos = await _fetch_github_repos(username)
     return await _analyze_github_profile_with_ai(username=username.strip(), repos=repos)
+
+
+@app.get("/api/score/github/{username}", response_model=ProfileScoreResponse)
+async def score_github_profile(username: str) -> ProfileScoreResponse:
+    repos = await _fetch_github_repos(username.strip())
+    return await _github_cv_profile_scores(username=username.strip(), repos=repos)
+
+
+@app.post("/api/score/cv-document", response_model=CvDocumentScoreResponse)
+async def score_cv_document(payload: CvDocumentScoreRequest) -> CvDocumentScoreResponse:
+    return await _score_cv_document_with_ai(text=payload.text.strip(), target_role=payload.target_role)
 
 
 @app.post("/api/ai/chat", response_model=LMStudioChatResponse)
