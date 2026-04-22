@@ -185,7 +185,7 @@ export default function CvPage() {
                 {scoreLoading ? "Skor hesaplanıyor..." : "GitHub + CV skoru (AI)"}
               </button>
               <div className="text-xs text-on-surface-variant">
-                PDF: repo adları, diller, README özetleri (MVP). Skor: LM Studio + temel sinyaller.
+                PDF: GitHub verisinden AI ile "Hakkımda" + "Yetkinlikler" ve repo özeti üretir.
               </div>
             </div>
           </div>
