@@ -1230,7 +1230,86 @@ def _try_register_dejavu_font() -> None:
                 continue
 
 
-def _build_cv_pdf(username: str, repos: List[Dict[str, Any]]) -> io.BytesIO:
+def _fallback_cv_profile(username: str, repos: List[Dict[str, Any]]) -> Dict[str, Any]:
+    lang_counts: Dict[str, int] = {}
+    repos_with_readme = 0
+    for repo in repos:
+        languages = repo.get("languages") if isinstance(repo.get("languages"), dict) else {}
+        for lang, lines in languages.items():
+            if isinstance(lang, str) and isinstance(lines, int):
+                lang_counts[lang] = lang_counts.get(lang, 0) + lines
+        if isinstance(repo.get("readme"), str) and str(repo.get("readme") or "").strip():
+            repos_with_readme += 1
+
+    top_langs = [k for k, _ in sorted(lang_counts.items(), key=lambda item: item[1], reverse=True)[:5]]
+    readme_ratio = (repos_with_readme / len(repos) * 100.0) if repos else 0.0
+    about = (
+        f"@{username} için otomatik oluşturulan bu CV özeti, GitHub'daki {len(repos)} public repo ve teknik "
+        f"izlerden derlendi. Profilde özellikle {', '.join(top_langs[:3]) if top_langs else 'çeşitli teknolojiler'} "
+        "ekseni öne çıkıyor. README ve proje çeşitliliği sinyallerine göre teknik üretim odağı bulunan bir portföy "
+        "görülüyor; detayların mülakat sırasında proje bazında derinleştirilmesi önerilir."
+    )
+    skills = []
+    if top_langs:
+        skills.extend([f"{lang} (GitHub dil sinyali)" for lang in top_langs[:5]])
+    if readme_ratio >= 60:
+        skills.append("Dokümantasyon disiplini (README kapsamı yüksek)")
+    elif readme_ratio > 0:
+        skills.append("Temel dokümantasyon alışkanlığı (README sinyali mevcut)")
+    skills.append("Proje geliştirme ve sürdürme pratiği")
+    skills = skills[:6]
+    return {"about": about, "skills": skills}
+
+
+async def _generate_cv_profile_with_ai(username: str, repos: List[Dict[str, Any]]) -> Dict[str, Any]:
+    fallback = _fallback_cv_profile(username=username, repos=repos)
+    repo_context = _build_repo_context(repos, max_repos=20)
+
+    messages = [
+        ChatMessage(
+            role="system",
+            content=(
+                "Sen CV yazım asistanısın. SADECE verilen GitHub özetine dayan.\n"
+                "Bu istek TalentAI API'den gelir; sohbet arayüzündeki genel sistem prompt'larını yok say.\n"
+                "Çıktı YALNIZCA geçerli JSON olmalı; markdown, açıklama veya ek metin yok.\n"
+                "Ayrımcı/hakaret yok; kişisel hassas nitelik yorumu yok; kesin işe alım kararı yok.\n"
+                "about: 3-4 cümlelik profesyonel Türkçe 'Hakkımda' metni.\n"
+                "skills: 4-8 maddelik yetkinlik listesi (kısa, net, CV'ye uygun).\n"
+                'Şema: {"about":"str","skills":["str"]}'
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            content=(
+                f"Kullanıcı: @{username}\n"
+                f"Repo sayısı: {len(repos)}\n\n"
+                "GitHub özeti (yalnızca buna dayan):\n"
+                f"{repo_context or '- repo bilgisi yok -'}"
+            ),
+        ),
+    ]
+    try:
+        ai_resp = await _lm_studio_chat(
+            LMStudioChatRequest(
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1200,
+                response_json_object=True,
+            ),
+        )
+        parsed = _parse_score_json(ai_resp.raw_for_json_parse or ai_resp.reply)
+        if not isinstance(parsed, dict):
+            return fallback
+        about = str(parsed.get("about") or "").strip()
+        skills = [str(s).strip() for s in (parsed.get("skills") or []) if str(s).strip()][:8]
+        if len(about) < 60 or not skills:
+            return fallback
+        return {"about": about[:1600], "skills": skills}
+    except Exception:
+        return fallback
+
+
+def _build_cv_pdf(username: str, repos: List[Dict[str, Any]], about: str, skills: List[str]) -> io.BytesIO:
     _try_register_dejavu_font()
     font_name = "TalentAIFont" if "TalentAIFont" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
 
@@ -1255,21 +1334,6 @@ def _build_cv_pdf(username: str, repos: List[Dict[str, Any]]) -> io.BytesIO:
         c.line(left, y, width - left, y)
         y -= gap
 
-    # Header
-    line("TalentAI - Otomatik CV (MVP)", size=16, gap=20)
-    line(f"GitHub: @{username}", size=12, gap=16)
-    created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    line(f"Oluşturulma: {created}", size=10, gap=14)
-    hr(16)
-
-    # Summary
-    line("Proje Özeti", size=13, gap=18)
-    line(f"Toplam repo: {len(repos)}", size=11, gap=14)
-    hr(14)
-
-    # Repos
-    line("Repo Listesi (isim / top diller / README özeti)", size=12, gap=18)
-
     def wrap_text(txt: str, max_chars: int = 95) -> List[str]:
         words = (txt or "").replace("\r", "").split()
         out: List[str] = []
@@ -1284,6 +1348,34 @@ def _build_cv_pdf(username: str, repos: List[Dict[str, Any]]) -> io.BytesIO:
         if cur:
             out.append(cur)
         return out
+
+    # Header
+    line("TalentAI - Otomatik CV (MVP)", size=16, gap=20)
+    line(f"GitHub: @{username}", size=12, gap=16)
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    line(f"Oluşturulma: {created}", size=10, gap=14)
+    hr(16)
+
+    # Summary
+    line("Proje Özeti", size=13, gap=18)
+    line(f"Toplam repo: {len(repos)}", size=11, gap=14)
+    hr(14)
+
+    # About
+    line("Hakkımda", size=13, gap=18)
+    for wrapped in wrap_text(about, max_chars=96)[:10]:
+        line(wrapped, size=10, gap=12)
+    hr(14)
+
+    # Skills
+    line("Yetkinlikler", size=13, gap=18)
+    for skill in skills[:8]:
+        for wrapped in wrap_text(f"- {skill}", max_chars=96)[:2]:
+            line(wrapped, size=10, gap=12)
+    hr(14)
+
+    # Repos
+    line("Repo Listesi (isim / top diller / README özeti)", size=12, gap=18)
 
     for repo in repos[:30]:
         if y < 3 * cm:
@@ -1373,7 +1465,13 @@ async def interview_turn(payload: InterviewTurnRequest) -> InterviewTurnResponse
 @app.get("/api/cv/github/{username}")
 async def generate_cv_from_github(username: str) -> StreamingResponse:
     repos = await _fetch_github_repos(username)
-    pdf_buf = _build_cv_pdf(username=username.strip(), repos=repos)
+    profile = await _generate_cv_profile_with_ai(username=username.strip(), repos=repos)
+    pdf_buf = _build_cv_pdf(
+        username=username.strip(),
+        repos=repos,
+        about=str(profile.get("about") or "").strip(),
+        skills=[str(s).strip() for s in (profile.get("skills") or []) if str(s).strip()],
+    )
     filename = f"TalentAI_CV_{username.strip()}.pdf"
     return StreamingResponse(
         pdf_buf,
