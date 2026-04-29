@@ -1,0 +1,16 @@
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\bin\Debug\net8.0\YGA.Application.deps.json
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\bin\Debug\net8.0\YGA.Application.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\bin\Debug\net8.0\YGA.Application.pdb
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\bin\Debug\net8.0\YGA.Domain.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\bin\Debug\net8.0\YGA.Domain.pdb
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.csproj.AssemblyReference.cache
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.AssemblyInfoInputs.cache
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.AssemblyInfo.cs
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.csproj.CoreCompileInputs.cache
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.sourcelink.json
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Appl.5C06479E.Up2Date
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\refint\YGA.Application.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\YGA.Application.pdb
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Application\obj\Debug\net8.0\ref\YGA.Application.dll

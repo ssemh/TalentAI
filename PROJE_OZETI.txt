@@ -1,0 +1,98 @@
+Backend CV - Genel Durum Ozeti
+Tarih: 2026-04-29
+
+1) Faz 1 - Kimlik Dogrulama ve Guvenli Konfigurasyon
+- JWT tabanli auth eklendi.
+  - Yeni endpointler: /api/v1/auth/register, /api/v1/auth/login
+  - Token icerisinde user claim'leri uretiliyor.
+- Korumali endpointler [Authorize] ile guvenli hale getirildi.
+  - /api/v1/analyze/github
+  - /api/v1/reports/{reportId}
+  - /api/v1/upload-cv
+  - /api/v1/cvs/{userId}
+- Kullanici kimligi artik request body'den degil JWT claim'den aliniyor.
+- Temp user uretimi kaldirildi (servisler mevcut user bekliyor).
+- User modeline PasswordHash alani eklendi.
+- EF migration eklendi ve veritabanina uygulandi:
+  - AddUserPasswordHash
+- Secret/config yapisi env odakli hale getirildi:
+  - ConnectionStrings__DefaultConnection
+  - Jwt__Key, Jwt__Issuer, Jwt__Audience, Jwt__ExpiresMinutes
+  - Github__ApiToken
+- Github token varsa Authorization header'a baglandi.
+
+2) Faz 2 - Is Kurali, Merkezi Hata Yonetimi, Upload Guvenligi
+- Hardcoded skorlar kaldirildi, GitHub profile JSON verisinden dinamik skor hesaplama eklendi.
+- Merkezi exception middleware eklendi:
+  - GlobalExceptionMiddleware
+  - Standart JSON hata cevabi donuyor.
+- Controller icindeki daginik try/catch yapisi sadeletildi.
+- CV upload guvenligi artirildi:
+  - Uzanti kontrolu
+  - MIME type allowlist
+  - Boyut limiti kontrolu (10 MB)
+  - Dosya adi sanitize edilmesi
+- Rapor detayinda score/profile loading duzeltildi (Include ile).
+- Rapor sahiplik kontrolu eklendi (baska kullanicinin raporuna erisim engeli).
+
+3) Faz 3 - Test Altyapisi, Worker Islevselligi, Observability
+- RequestContextMiddleware eklendi:
+  - X-Correlation-Id uretimi ve response'a ekleme
+  - Request baslangic/bitis log'lari
+- API ve Worker loglama JSON (structured logging) formatina alindi.
+- Worker gercek metrik isi yapacak sekilde gelistirildi:
+  - Belirli araliklarla Users/Reports/Cvs sayilarini DB'den okuyup logluyor
+  - Worker:StatsIntervalSeconds konfigurasyonu eklendi
+- Worker tarafina AppDbContext + PostgreSQL baglantisi eklendi.
+- Worker heartbeat mekanizmasi eklendi:
+  - Yeni tablo: worker_heartbeats
+  - Worker durumunu DB'de periyodik guncelliyor (Healthy/Degraded)
+- API health endpointi eklendi:
+  - /api/v1/health/worker
+  - /api/v1/health/live
+  - /api/v1/health
+- Yeni test projesi eklendi: YGA.Tests
+- CI pipeline eklendi:
+  - .github/workflows/ci.yml
+  - Push/PR'da restore + build + test zorunlu
+
+4) Faz 4 - Repo-Level Metrikler (YENi)
+- GitHub API'den repo listesi cekme eklendi:
+  - GET /users/{username}/repos?sort=pushed&per_page=100&type=owner
+  - GithubService.GetUserReposAsync() implementasyonu
+- Skorlama sistemi 3'ten 5'e genisletildi:
+  - ProfileCompleteness: Profil alanlari dolulugu (name, bio, blog, location, company)
+  - RepositoryActivity: Son 6 ayda push yapilan repo orani + profil metrikleri
+  - CodeQuality: Repo'larda aciklama, lisans, orijinallik, homepage orani
+  - LanguageDiversity (YENI): Kac farkli programlama dili kullanilmis (8+ dil = 100)
+  - CommunityEngagement (YENI): Toplam star + fork (topluluk etkilesimi)
+- GithubProfile entity'sine RawReposJson alani eklendi
+- EF migration: AddReposJsonToGithubProfile
+- Skor kaydetme AddRangeAsync ile optimize edildi
+
+5) Kod Temizligi
+- CI pipeline .NET versiyonu duzeltildi (9.0.x -> 8.0.x)
+- Bos dosyalar silindi (Entities.cs, GithubContracts.cs, Infrastructure/Class1.cs)
+- Domain/Class1.cs -> Entities.cs olarak yeniden adlandirildi
+- Application/Class1.cs -> IGithubService.cs olarak yeniden adlandirildi
+- ApiControllerBase olusturuldu (GetUserId() duplicate'i ortaklastirildi)
+- AuthController'daki gereksiz try/catch temizlendi
+- API_DOCS.md olusturuldu (frontend ekibi icin endpoint dokumantasyonu)
+
+6) Dogrulama Sonucu
+- Build: basarili (0 hata, 0 uyari)
+- Test: 9/9 basarili
+  - AnalyzeGithubAsync_CreatesFiveDynamicScores
+  - AnalyzeGithubAsync_WithNoRepos_StillCreatesScores
+  - GetReportByIdAsync_ReturnsReportWithScoresAndProfile
+  - BuildScores_HighQualityProfile_ProducesHighScores
+  - RegisterAndLogin_ShouldSucceed
+  - Login_WithWrongPassword_ShouldReturnNull
+  - GlobalExceptionMiddleware testleri (2 adet)
+  - RequestContextMiddleware testi
+
+7) Sonraki Mantikli Adimlar
+- Integration testler (auth + analyze + report ownership akisi)
+- Frontend entegrasyon destegi
+- Rate limiting middleware
+- Pagination (CV/rapor listesi)

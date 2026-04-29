@@ -1,0 +1,12 @@
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\bin\Release\net8.0\YGA.Domain.deps.json
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\bin\Release\net8.0\YGA.Domain.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\bin\Release\net8.0\YGA.Domain.pdb
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.AssemblyInfoInputs.cache
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.AssemblyInfo.cs
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.csproj.CoreCompileInputs.cache
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.sourcelink.json
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\refint\YGA.Domain.dll
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\YGA.Domain.pdb
+C:\Users\Msı\Projeler Cursor\Backend CV\YGA.Domain\obj\Release\net8.0\ref\YGA.Domain.dll
