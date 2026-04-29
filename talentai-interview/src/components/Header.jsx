@@ -24,9 +24,9 @@ export default function Header({ candidateName = "Candidate", status = "In Progr
           <div className="h-9 w-9 rounded-2xl bg-gradient-to-br from-violet-500 to-blue-500 shadow-[0_0_30px_rgba(139,92,246,0.25)]" />
           <div className="leading-tight">
             <div className="text-sm font-semibold tracking-tight text-white">
-              DevAnalyzer
+              TalentAI
             </div>
-            <div className="text-xs text-white/60">AI Interview</div>
+            <div className="text-xs text-white/60">Interview</div>
           </div>
         </div>
 

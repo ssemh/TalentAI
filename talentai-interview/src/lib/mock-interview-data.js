@@ -45,7 +45,7 @@ export const mockGitHub = {
     activityNote: "Steady weekly cadence, occasional refactor bursts.",
   },
   repos: [
-    { name: "devanalyzer-ui", lang: "TypeScript", stars: 54, recent: "2d ago" },
+    { name: "talentai-interview", lang: "TypeScript", stars: 54, recent: "2d ago" },
     { name: "chart-kit", lang: "TypeScript", stars: 31, recent: "5d ago" },
     { name: "etl-pipelines", lang: "Python", stars: 18, recent: "1w ago" },
     { name: "infra-scripts", lang: "Shell", stars: 9, recent: "2w ago" },
