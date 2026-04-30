@@ -1,0 +1,74 @@
+
+
+Backend CV - Durum ve Öncelik Notu
+Yapılanlar (Mevcut)
+
+ Proje katmanlı yapıda kuruldu (API, Application, Infrastructure, Domain, Worker)
+
+ GitHub analiz endpoint’i var (POST /api/v1/analyze/github)
+
+ Rapor getirme endpoint’i var (GET /api/v1/reports/{reportId})
+
+ CV upload endpoint’i var (POST /api/v1/upload-cv)
+
+ CV listeleme endpoint’i var (GET /api/v1/cvs/{userId})
+
+ PostgreSQL + EF Core bağlantısı ve migration mevcut
+
+ Swagger aktif
+
+
+Kritik Eksikler (Öncelik 1 - Acil)
+
+
+ Authentication + Authorization (JWT, [Authorize])
+
+ Hardcoded analiz skorlarının gerçek analiz motoruna çevrilmesi
+
+ Secret yönetimi (appsettings içindeki düz şifrelerin kaldırılması)
+
+
+
+
+
+Yüksek Öncelik (Öncelik 2)
+
+
+ Unit test + integration test altyapısı
+
+ Merkezi exception handling middleware
+
+ Upload güvenliği (MIME doğrulama, boyut limiti, filename sanitization)
+
+
+Orta Öncelik (Öncelik 3)
+
+
+ Logging/observability iyileştirmesi (structured log, correlation id)
+
+ Aynı GitHub kullanıcısı için dedup/upsert stratejisi
+
+ Worker’a gerçek iş akışı eklenmesi
+
+ .http dosyasının güncel endpoint’lere göre düzenlenmesi
+
+ Repo hijyeni (.gitignore, bin/obj temizliği)
+Ne Yapacağız? (Sıralı Plan)
+
+Faz 1 (Hemen)
+
+JWT auth altyapısı
+Kullanıcı kimliğini temp’ten çıkarıp gerçek auth user’a bağlama
+Secret’ları env/user-secrets’a taşıma
+
+Faz 2
+
+Analiz servisinde gerçek skor hesaplama kural seti
+Hata yönetimi + standart API error response
+Upload güvenlik kontrolleri
+
+Faz 3
+
+Test yazımı (servis + controller integration)
+Worker işlevselleştirme
+Gözlemlenebilirlik ve teknik borç temizliği
