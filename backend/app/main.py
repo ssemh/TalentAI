@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,7 @@ MAX_README_CHARS = int(os.getenv("MAX_README_CHARS", "20000"))
 CV_TEXT_MAX_CHARS = int(os.getenv("CV_TEXT_MAX_CHARS", "24000"))
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://127.0.0.1:1234/v1").rstrip("/")
 LM_STUDIO_MODEL = os.getenv("LM_STUDIO_MODEL", "local-model")
+GITHUB_REPO_CACHE_TTL_SECONDS = int(os.getenv("GITHUB_REPO_CACHE_TTL_SECONDS", "900"))
 
 _CV_DIM_KEYS = (
     "structure_clarity",
@@ -36,6 +38,27 @@ _CV_DIM_KEYS = (
     "skills_depth",
     "professional_tone",
 )
+_GITHUB_REPO_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_cached_repos(username: str, allow_stale: bool = False) -> Optional[List[Dict[str, Any]]]:
+    entry = _GITHUB_REPO_CACHE.get(username)
+    if not entry:
+        return None
+    expires_at = float(entry.get("expires_at", 0))
+    repos = entry.get("repos")
+    if not isinstance(repos, list):
+        return None
+    if allow_stale or expires_at > time.time():
+        return repos
+    return None
+
+
+def _set_cached_repos(username: str, repos: List[Dict[str, Any]]) -> None:
+    _GITHUB_REPO_CACHE[username] = {
+        "repos": repos,
+        "expires_at": time.time() + max(60, GITHUB_REPO_CACHE_TTL_SECONDS),
+    }
 
 
 def _github_token() -> Optional[str]:
@@ -111,6 +134,9 @@ async def _fetch_github_repos(username: str) -> List[Dict[str, Any]]:
     username = username.strip()
     if not username:
         raise HTTPException(status_code=400, detail="GitHub username boş olamaz.")
+    cached = _get_cached_repos(username)
+    if cached is not None:
+        return cached
 
     async with httpx.AsyncClient(timeout=30.0, headers=_github_headers()) as client:
         repos_url = f"{GITHUB_API_URL}/users/{username}/repos?per_page=100&type=owner"
@@ -134,6 +160,12 @@ async def _fetch_github_repos(username: str) -> List[Dict[str, Any]]:
             if repos_resp.status_code == 403:
                 body = repos_resp.text or ""
                 if "rate limit" in body.lower():
+                    stale = _get_cached_repos(username, allow_stale=True)
+                    if stale is not None:
+                        return stale
+                    allow_empty = os.getenv("GITHUB_ALLOW_EMPTY_ON_RATE_LIMIT", "true").strip().lower()
+                    if allow_empty not in ("0", "false", "no", "n"):
+                        return []
                     raise HTTPException(
                         status_code=429,
                         detail="GitHub API rate limit aşıldı. Geçerli GITHUB_TOKEN kullanın.",
@@ -173,6 +205,7 @@ async def _fetch_github_repos(username: str) -> List[Dict[str, Any]]:
             if isinstance(b, Exception):
                 continue
             results.append(b)
+        _set_cached_repos(username, results)
         return results
 
 
@@ -924,14 +957,31 @@ async def _score_cv_document_with_ai(text: str, target_role: Optional[str]) -> C
         ),
     ]
 
-    ai_resp = await _lm_studio_chat(
-        LMStudioChatRequest(
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1400,
-            response_json_object=True,
-        ),
-    )
+    try:
+        ai_resp = await _lm_studio_chat(
+            LMStudioChatRequest(
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1400,
+                response_json_object=True,
+            ),
+        )
+    except HTTPException:
+        q = max(0, min(100, base))
+        return CvDocumentScoreResponse(
+            overall_score=q,
+            overall_score_baseline=base,
+            overall_score_ai=None,
+            dimensions={k: q for k in _CV_DIM_KEYS},
+            summary=(
+                "LM Studio şu an erişilemediği için yalnızca metin tabanlı temel skor gösteriliyor. "
+                "AI modeli açıldığında daha detaylı değerlendirme üretilecektir."
+            ),
+            strengths=[],
+            improvements=[],
+            signals=signals,
+            model="baseline-fallback",
+        )
     parsed = _parse_score_json(ai_resp.raw_for_json_parse or ai_resp.reply)
     overall_ai = _clamp_int_score(parsed.get("overall_score")) if isinstance(parsed, dict) else None
     dims_raw = parsed.get("dimensions") if isinstance(parsed, dict) else None
@@ -1001,14 +1051,33 @@ async def _github_cv_profile_scores(username: str, repos: List[Dict[str, Any]]) 
         ),
     ]
 
-    ai_resp = await _lm_studio_chat(
-        LMStudioChatRequest(
-            messages=messages,
-            temperature=0.15,
-            max_tokens=1400,
-            response_json_object=True,
-        ),
-    )
+    try:
+        ai_resp = await _lm_studio_chat(
+            LMStudioChatRequest(
+                messages=messages,
+                temperature=0.15,
+                max_tokens=1400,
+                response_json_object=True,
+            ),
+        )
+    except HTTPException:
+        return ProfileScoreResponse(
+            username=username,
+            github_score=int(baseline["github_score"]),
+            cv_readiness_score=int(baseline["cv_readiness_score"]),
+            github_score_baseline=int(baseline["github_score"]),
+            cv_readiness_score_baseline=int(baseline["cv_readiness_score"]),
+            github_score_ai=None,
+            cv_readiness_score_ai=None,
+            summary=(
+                "LM Studio erişilemediği için AI katkısı eklenemedi; skorlar yalnızca GitHub sinyallerine "
+                "dayalı temel modelden hesaplandı."
+            ),
+            strengths=[],
+            improvements=[],
+            signals=baseline["signals"],
+            model="baseline-fallback",
+        )
     parsed = _parse_score_json(ai_resp.raw_for_json_parse or ai_resp.reply)
 
     gh_ai = _clamp_int_score(parsed.get("github_profile_score")) if isinstance(parsed, dict) else None
@@ -1101,19 +1170,41 @@ async def _analyze_github_profile_with_ai(username: str, repos: List[Dict[str, A
         ),
     ]
 
-    ai_resp = await _lm_studio_chat(
-        LMStudioChatRequest(
-            messages=messages,
-            temperature=max(0.0, min(2.0, analysis_temp)),
-            max_tokens=max(256, min(4096, analysis_max)),
+    try:
+        ai_resp = await _lm_studio_chat(
+            LMStudioChatRequest(
+                messages=messages,
+                temperature=max(0.0, min(2.0, analysis_temp)),
+                max_tokens=max(256, min(4096, analysis_max)),
+            )
         )
-    )
-    return GithubAnalysisResponse(
-        username=username,
-        repo_count=len(repos),
-        analysis=ai_resp.reply,
-        model=ai_resp.model,
-    )
+        return GithubAnalysisResponse(
+            username=username,
+            repo_count=len(repos),
+            analysis=ai_resp.reply,
+            model=ai_resp.model,
+        )
+    except HTTPException:
+        baseline = _github_baseline_scores(repos)
+        signals = baseline.get("signals", {})
+        analysis = (
+            "Özet\n"
+            f"- @{username} için {len(repos)} repo sinyali işlendi.\n\n"
+            "Güçlü sinyaller\n"
+            f"- README kapsama oranı: %{signals.get('readme_coverage_pct', '-')}\n"
+            f"- Dil çeşitliliği: {signals.get('unique_languages', '-')}\n\n"
+            "Belirsizlikler ve veri boşlukları\n"
+            "- AI analiz katmanı şu an devre dışı, bu nedenle metin içgörüsü sınırlı.\n\n"
+            "Mülakat için sorular\n"
+            "- Son projende aldığın en kritik teknik kararı ve trade-off'larını anlatır mısın?\n"
+            "- Test stratejini nasıl kurduğunu somut örnekle açıklar mısın?"
+        )
+        return GithubAnalysisResponse(
+            username=username,
+            repo_count=len(repos),
+            analysis=analysis,
+            model="baseline-fallback",
+        )
 
 
 async def _start_interview(username: str, repos: List[Dict[str, Any]]) -> InterviewStartResponse:
@@ -1186,7 +1277,20 @@ async def _interview_turn(payload: InterviewTurnRequest, repos: List[Dict[str, A
         ),
     ]
 
-    ai_resp = await _lm_studio_chat(LMStudioChatRequest(messages=messages, temperature=0.3, max_tokens=650))
+    try:
+        ai_resp = await _lm_studio_chat(LMStudioChatRequest(messages=messages, temperature=0.3, max_tokens=650))
+    except HTTPException:
+        return InterviewTurnResponse(
+            username=payload.username,
+            feedback=(
+                "- Cevabın teknik bağlam içeriyor.\n"
+                "- AI motoru geçici olarak erişilemediği için kısa fallback geri bildirim gösteriliyor.\n"
+                "- Bir sonraki cevapta kararının etkisini metrikle desteklemeyi dene."
+            ),
+            next_question=_fallback_question_by_mode(payload.username, repos, prefer_general),
+            model="baseline-fallback",
+            interview_ended=False,
+        )
     feedback = _normalize_feedback(_extract_between(ai_resp.reply, "[FEEDBACK]", "[/FEEDBACK]"))
     next_question = _normalize_question(_extract_between(ai_resp.reply, "[NEXT_QUESTION]", "[/NEXT_QUESTION]"))
 
